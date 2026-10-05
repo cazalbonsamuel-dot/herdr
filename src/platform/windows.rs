@@ -1782,7 +1782,7 @@ fn prepare_cached_foreground_selection(
 
 impl CachedForegroundSelection {
     fn can_cache(shell_pid: u32, snapshot: &ProcessSnapshot, job: &ForegroundJob) -> bool {
-        // Idle native shells cannot use Git Bash's escaped-agent fallback.
+        // Native shells with no children cannot use Git Bash's escaped-agent fallback.
         // Keep reevaluating unknown children; a first child invalidates topology.
         job.process_group_id != shell_pid
             || (snapshot.entry(shell_pid).is_some_and(|shell| {
