@@ -1014,9 +1014,8 @@ impl ProcessSnapshot {
 pub fn raise_server_nofile_limit() {}
 
 pub(crate) fn apply_pane_runtime_marker_platform(command: &mut portable_pty::CommandBuilder) {
-    if command_uses_git_bash(command) {
-        command.env(PANE_RUNTIME_MARKER_ENV_VAR, next_pane_runtime_marker());
-    }
+    // A native pane shell can launch Git Bash later, losing native ancestry at exec.
+    command.env(PANE_RUNTIME_MARKER_ENV_VAR, next_pane_runtime_marker());
 }
 
 fn next_pane_runtime_marker() -> String {
@@ -1566,7 +1565,7 @@ fn select_pane_foreground_job_from_snapshot_uncached(
     select_pane_foreground_job_from_snapshot_with_runtime_inspection(
         shell_pid,
         snapshot,
-        |shell| process_is_git_bash(shell.pid),
+        |entry| entry.name.eq_ignore_ascii_case("bash.exe") && process_is_git_bash(entry.pid),
         |entry| process_runtime_marker(entry.pid),
     )
 }
@@ -1574,14 +1573,14 @@ fn select_pane_foreground_job_from_snapshot_uncached(
 fn select_pane_foreground_job_from_snapshot_with_runtime_inspection(
     shell_pid: u32,
     snapshot: &ProcessSnapshot,
-    shell_is_git_bash: impl FnOnce(&WindowsProcessEntry) -> bool,
+    mut shell_is_git_bash: impl FnMut(&WindowsProcessEntry) -> bool,
     mut runtime_marker: impl FnMut(&WindowsProcessEntry) -> Option<String>,
 ) -> Option<ForegroundJob> {
     let entries = &snapshot.entries;
     let shell = snapshot.entry(shell_pid)?;
     let descendants = descendant_entries(shell_pid, snapshot);
     let mut candidates = Vec::new();
-    for entry in std::iter::once(shell).chain(descendants) {
+    for entry in std::iter::once(shell).chain(descendants.iter().copied()) {
         if process_entry_identifies_agent(entry) {
             candidates.push(entry);
         }
@@ -1590,7 +1589,11 @@ fn select_pane_foreground_job_from_snapshot_with_runtime_inspection(
     if let Some(selected) = select_topmost_agent_chain_candidate(&candidates, snapshot) {
         return Some(foreground_job_from_entry(selected));
     }
-    if !candidates.is_empty() || !shell_is_git_bash(shell) {
+    if !candidates.is_empty()
+        || !std::iter::once(shell)
+            .chain(descendants)
+            .any(&mut shell_is_git_bash)
+    {
         return Some(foreground_job_from_entry(shell));
     }
 
@@ -2034,40 +2037,6 @@ fn process_executable_path(process: HANDLE) -> Option<String> {
         return None;
     }
     String::from_utf16(&path[..len as usize]).ok()
-}
-
-fn command_uses_git_bash(command: &portable_pty::CommandBuilder) -> bool {
-    let Some(program) = command.get_argv().first() else {
-        return false;
-    };
-    let path = std::path::Path::new(program);
-    if path.is_absolute() {
-        return is_git_bash_executable_path(path);
-    }
-    if program.to_string_lossy().contains(['/', '\\']) {
-        return false;
-    }
-
-    let Some(file_name) = path.file_name().and_then(OsStr::to_str) else {
-        return false;
-    };
-    let candidate_name = if file_name.eq_ignore_ascii_case("bash") {
-        "bash.exe"
-    } else if file_name.eq_ignore_ascii_case("bash.exe") {
-        file_name
-    } else {
-        return false;
-    };
-    let search_path = command
-        .get_env("PATH")
-        .map(OsStr::to_os_string)
-        .or_else(|| std::env::var_os("PATH"));
-    search_path.is_some_and(|search_path| {
-        std::env::split_paths(&search_path)
-            .map(|directory| directory.join(candidate_name))
-            .find(|candidate| candidate.is_file())
-            .is_some_and(|candidate| is_git_bash_executable_path(&candidate))
-    })
 }
 
 fn is_git_bash_executable_path(path: &std::path::Path) -> bool {
@@ -4137,18 +4106,42 @@ mod tests {
     }
 
     #[test]
-    fn windows_process_tree_skips_runtime_inspection_for_non_git_bash_shell() {
+    fn windows_process_tree_attributes_escaped_agent_through_nested_git_bash() {
+        for name in ["cmd.exe", "powershell.exe", "pwsh.exe"] {
+            let snapshot = super::ProcessSnapshot::new(vec![
+                test_entry(10, 1, name, &[name]),
+                test_entry(20, 10, "bash.exe", &[r"C:\Program Files\Git\bin\bash.exe"]),
+                test_entry(30, 99, "launcher.exe", &["codex.exe"]),
+                test_entry(40, 30, "codex.exe", &["codex.exe"]),
+                test_entry(50, 98, "claude.exe", &["claude.exe"]),
+            ]);
+            let job = super::select_pane_foreground_job_from_snapshot_with_runtime_inspection(
+                10,
+                &snapshot,
+                |entry| entry.pid == 20,
+                |entry| Some(if entry.pid == 50 { "pane-b" } else { "pane-a" }.into()),
+            )
+            .unwrap();
+
+            assert_eq!(job.process_group_id, 30, "native pane shell: {name}");
+            assert_eq!(job.processes[0].name, "launcher.exe");
+        }
+    }
+
+    #[test]
+    fn windows_process_tree_skips_runtime_inspection_for_unrelated_git_bash() {
         let entries = vec![
             test_entry(10, 1, "powershell.exe", &["powershell.exe"]),
             test_entry(20, 99, "codex.exe", &["codex.exe"]),
+            test_entry(30, 1, "bash.exe", &["bash.exe"]),
         ];
         let snapshot = super::ProcessSnapshot::new(entries);
 
         let job = super::select_pane_foreground_job_from_snapshot_with_runtime_inspection(
             10,
             &snapshot,
-            |_| false,
-            |_| panic!("runtime marker must not be read for non-Git-Bash panes"),
+            |entry| entry.pid == 30,
+            |_| panic!("runtime marker must not be read without this pane's Git Bash"),
         )
         .unwrap();
 
@@ -4986,35 +4979,25 @@ mod tests {
     }
 
     #[test]
-    fn pane_runtime_marker_is_added_only_to_git_bash_environment() {
-        let root = std::env::temp_dir().join(format!(
-            "herdr-git-bash-test-{}",
-            super::next_pane_runtime_marker()
-        ));
-        fs::create_dir_all(root.join("bin")).expect("create Git Bash bin fixture");
-        fs::create_dir_all(root.join("usr").join("bin")).expect("create Git Bash usr/bin fixture");
-        fs::create_dir_all(root.join("cmd")).expect("create Git Bash cmd fixture");
-        fs::write(root.join("bin").join("bash.exe"), []).expect("create Bash fixture");
-        fs::write(root.join("usr").join("bin").join("msys-2.0.dll"), [])
-            .expect("create MSYS runtime fixture");
-        fs::write(root.join("cmd").join("git.exe"), []).expect("create Git fixture");
-
-        let mut git_bash = portable_pty::CommandBuilder::new(root.join("bin").join("bash.exe"));
-        super::apply_pane_runtime_marker_platform(&mut git_bash);
-        let mut path_resolved_git_bash = portable_pty::CommandBuilder::new("bash.exe");
-        path_resolved_git_bash.env("PATH", root.join("bin"));
-        super::apply_pane_runtime_marker_platform(&mut path_resolved_git_bash);
-        let mut cmd = portable_pty::CommandBuilder::new("cmd.exe");
-        super::apply_pane_runtime_marker_platform(&mut cmd);
-
-        assert!(git_bash
-            .get_env(super::PANE_RUNTIME_MARKER_ENV_VAR)
-            .is_some_and(|value| !value.is_empty()));
-        assert!(path_resolved_git_bash
-            .get_env(super::PANE_RUNTIME_MARKER_ENV_VAR)
-            .is_some_and(|value| !value.is_empty()));
-        assert!(cmd.get_env(super::PANE_RUNTIME_MARKER_ENV_VAR).is_none());
-        fs::remove_dir_all(root).expect("remove Git Bash fixture");
+    fn pane_runtime_marker_is_fresh_for_every_windows_pane() {
+        let mut markers = std::collections::HashSet::new();
+        for program in [
+            r"C:\Program Files\Git\bin\bash.exe",
+            "bash.exe",
+            "cmd.exe",
+            "powershell.exe",
+            "pwsh.exe",
+        ] {
+            let mut command = portable_pty::CommandBuilder::new(program);
+            command.env(super::PANE_RUNTIME_MARKER_ENV_VAR, "parent-pane");
+            super::apply_pane_runtime_marker_platform(&mut command);
+            let marker = command
+                .get_env(super::PANE_RUNTIME_MARKER_ENV_VAR)
+                .expect("native shells can launch Git Bash later");
+            assert!(!marker.is_empty());
+            assert_ne!(marker, "parent-pane");
+            assert!(markers.insert(marker.to_os_string()));
+        }
     }
 
     #[test]
